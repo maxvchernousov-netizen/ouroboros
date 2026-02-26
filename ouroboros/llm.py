@@ -299,20 +299,24 @@ class ClaudeCliClient:
             prompt_text = _embed_tool_schemas(prompt_text, tools)
 
         # Build command
+        max_turns = "1"
         cmd = [
             claude_bin, "-p",
             "--output-format", "json",
             "--model", cli_model,
-            "--max-turns", "1",
             "--no-session-persistence",
         ]
 
         if tools:
             # Use JSON schema for structured tool-use output
+            # --json-schema needs 2 turns (model output + schema validation)
+            max_turns = "2"
             cmd.extend(["--json-schema", json.dumps(RESPONSE_SCHEMA)])
             cmd.extend(["--append-system-prompt", _FORMAT_INSTRUCTION])
             # Disable built-in Claude Code tools — we use our own
             cmd.extend(["--tools", ""])
+
+        cmd.extend(["--max-turns", max_turns])
 
         # Run the CLI, feeding prompt via stdin
         # Remove CLAUDECODE env var to prevent "nested session" error
@@ -356,49 +360,48 @@ class ClaudeCliClient:
             else:
                 raise RuntimeError(f"Failed to parse Claude CLI output: {stdout[:500]}")
 
-        # Extract the result text
-        result_text = payload.get("result", "")
-
-        # Estimate usage (no real token counts from CLI)
-        prompt_tokens = _estimate_tokens(prompt_text)
-        completion_tokens = _estimate_tokens(result_text)
+        # Extract usage from CLI response (real token counts available)
+        cli_usage = payload.get("usage", {})
+        prompt_tokens = int(cli_usage.get("input_tokens", 0)) + int(cli_usage.get("cache_read_input_tokens", 0))
+        completion_tokens = int(cli_usage.get("output_tokens", 0))
+        if prompt_tokens == 0:
+            prompt_tokens = _estimate_tokens(prompt_text)
         usage = {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
-            "cached_tokens": 0,
-            "cache_write_tokens": 0,
+            "cached_tokens": int(cli_usage.get("cache_read_input_tokens", 0)),
+            "cache_write_tokens": int(cli_usage.get("cache_creation_input_tokens", 0)),
             "cost": 0.0,  # Free with Max subscription
         }
 
-        # If we used JSON schema (tools mode), parse structured response
+        # If we used JSON schema (tools mode), parse structured_output
         if tools:
-            return self._parse_structured_response(result_text, usage)
+            structured = payload.get("structured_output")
+            if structured and isinstance(structured, dict):
+                return self._parse_structured_dict(structured, usage)
+            # Fallback: try result field
+            result_text = payload.get("result", "")
+            if result_text:
+                return self._parse_structured_response(result_text, usage)
+            return {"content": "", "tool_calls": None}, usage
 
-        # No tools — plain text response
+        # No tools — plain text response from result field
+        result_text = payload.get("result", "")
         return {"content": result_text, "tool_calls": None}, usage
 
-    def _parse_structured_response(
-        self, result_text: str, usage: Dict[str, Any]
+    def _parse_structured_dict(
+        self, structured: Dict[str, Any], usage: Dict[str, Any]
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """Parse JSON-schema-validated response into the format loop.py expects."""
-        try:
-            structured = json.loads(result_text)
-        except json.JSONDecodeError:
-            # If parsing fails, treat as plain text response
-            log.warning("Failed to parse structured response, treating as text: %s", result_text[:200])
-            return {"content": result_text, "tool_calls": None}, usage
-
+        """Parse structured_output dict (from --json-schema) into loop.py format."""
         action = structured.get("action", "text_response")
         content = structured.get("content", "")
 
         if action == "tool_calls":
             raw_calls = structured.get("tool_calls") or []
             if not raw_calls:
-                # No actual tool calls despite action=tool_calls, treat as text
                 return {"content": content, "tool_calls": None}, usage
 
-            # Convert to OpenAI-compatible tool_calls format
             tool_calls = []
             for tc in raw_calls:
                 tool_calls.append({
@@ -414,8 +417,19 @@ class ClaudeCliClient:
                 })
             return {"content": content, "tool_calls": tool_calls}, usage
 
-        # text_response
         return {"content": content, "tool_calls": None}, usage
+
+    def _parse_structured_response(
+        self, result_text: str, usage: Dict[str, Any]
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Parse JSON string result into the format loop.py expects (fallback)."""
+        try:
+            structured = json.loads(result_text)
+        except json.JSONDecodeError:
+            log.warning("Failed to parse structured response, treating as text: %s", result_text[:200])
+            return {"content": result_text, "tool_calls": None}, usage
+
+        return self._parse_structured_dict(structured, usage)
 
     def vision_query(
         self,
