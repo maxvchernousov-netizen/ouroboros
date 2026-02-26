@@ -203,6 +203,7 @@ def _claude_code_edit(ctx: ToolContext, prompt: str, cwd: str = "") -> str:
         )
 
         env = os.environ.copy()
+        env.pop("CLAUDECODE", None)  # Prevent "nested session" error
         env["ANTHROPIC_API_KEY"] = api_key
         try:
             if hasattr(os, "geteuid") and os.geteuid() == 0:

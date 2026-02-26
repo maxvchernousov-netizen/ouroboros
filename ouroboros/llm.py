@@ -315,6 +315,9 @@ class ClaudeCliClient:
             cmd.extend(["--tools", ""])
 
         # Run the CLI, feeding prompt via stdin
+        # Remove CLAUDECODE env var to prevent "nested session" error
+        env = os.environ.copy()
+        env.pop("CLAUDECODE", None)
         try:
             result = subprocess.run(
                 cmd,
@@ -322,7 +325,7 @@ class ClaudeCliClient:
                 capture_output=True,
                 text=True,
                 timeout=300,
-                env=os.environ.copy(),
+                env=env,
             )
         except subprocess.TimeoutExpired:
             raise RuntimeError("Claude CLI timed out after 300s")
