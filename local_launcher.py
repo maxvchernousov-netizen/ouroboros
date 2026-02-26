@@ -271,6 +271,11 @@ from supervisor.events import dispatch_event
 # ----------------------------
 # 5) Bootstrap repo
 # ----------------------------
+# Fix narrow fetch refspec (e.g. cloned with --single-branch)
+subprocess.run(
+    ["git", "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"],
+    cwd=str(REPO_DIR), check=False,
+)
 ensure_repo_present()
 ok, msg = safe_restart(reason="bootstrap", unsynced_policy="rescue_and_reset")
 assert ok, f"Bootstrap failed: {msg}"
