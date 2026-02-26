@@ -1,13 +1,15 @@
 """
 Apply-patch shim for Claude Code CLI.
-Writes apply_patch script to /usr/local/bin/ on import.
+Writes apply_patch script to ~/.local/bin/ (or /usr/local/bin/ if writable).
 
 Supports: *** Update File, *** Add File, *** Delete File, *** End of File.
 """
+import os
 import pathlib
 
 
-APPLY_PATCH_PATH = pathlib.Path("/usr/local/bin/apply_patch")
+_LOCAL_BIN = pathlib.Path.home() / ".local" / "bin"
+APPLY_PATCH_PATH = _LOCAL_BIN / "apply_patch" if not pathlib.Path("/usr/local/bin").exists() or not os.access("/usr/local/bin", os.W_OK) else pathlib.Path("/usr/local/bin/apply_patch")
 APPLY_PATCH_CODE = r"""#!/usr/bin/env python3
 import os
 import sys
@@ -172,7 +174,11 @@ if __name__ == "__main__":
 
 
 def install():
-    """Install apply_patch script to /usr/local/bin/."""
+    """Install apply_patch script to ~/.local/bin/ (or /usr/local/bin/ if writable)."""
     APPLY_PATCH_PATH.parent.mkdir(parents=True, exist_ok=True)
     APPLY_PATCH_PATH.write_text(APPLY_PATCH_CODE, encoding="utf-8")
     APPLY_PATCH_PATH.chmod(0o755)
+    # Ensure directory is in PATH for subprocess calls
+    bin_dir = str(APPLY_PATCH_PATH.parent)
+    if bin_dir not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = f"{bin_dir}:{os.environ.get('PATH', '')}"

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "ouroboros-local",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["local_launcher.py"],
+      "port": 0
+    }
+  ]
+}

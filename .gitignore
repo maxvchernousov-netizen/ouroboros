@@ -19,6 +19,9 @@ build/
 .pytest_cache/
 .mypy_cache/
 
+# Local data
+data/
+
 # OS
 .DS_Store
 Thumbs.db
