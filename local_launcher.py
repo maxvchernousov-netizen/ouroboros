@@ -180,8 +180,8 @@ os.environ["ANTHROPIC_API_KEY"] = str(ANTHROPIC_API_KEY or "")
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 # Remove CLAUDECODE env var to prevent "nested session" errors in subprocess CLI calls
 os.environ.pop("CLAUDECODE", None)
-# macOS uses "spawn" for multiprocessing by default — this is correct
-os.environ.setdefault("OUROBOROS_WORKER_START_METHOD", "spawn")
+# Use "fork" — "spawn" re-imports __main__ causing worker crashes on macOS
+os.environ.setdefault("OUROBOROS_WORKER_START_METHOD", "fork")
 
 # ----------------------------
 # 2) Local storage (replaces Google Drive)
