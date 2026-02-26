@@ -364,7 +364,7 @@ def build_llm_messages(
 
     dynamic_text = "\n\n".join(dynamic_parts)
 
-    # System message with 3 content blocks for optimal caching
+    # System message with 3 content blocks (static, semi-stable, dynamic)
     messages: List[Dict[str, Any]] = [
         {
             "role": "system",
@@ -372,12 +372,10 @@ def build_llm_messages(
                 {
                     "type": "text",
                     "text": static_text,
-                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
                 },
                 {
                     "type": "text",
                     "text": semi_stable_text,
-                    "cache_control": {"type": "ephemeral"},
                 },
                 {
                     "type": "text",

@@ -1,20 +1,89 @@
 """
-Ouroboros — LLM client.
+Ouroboros — LLM client (Claude CLI backend).
 
-The only module that communicates with the LLM API (OpenRouter).
+Uses Claude Code CLI (`claude -p`) instead of OpenRouter API.
+All LLM calls go through the ClaudeCliClient class.
+Requires an active Claude Max subscription.
+
 Contract: chat(), default_model(), available_models(), add_usage().
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
-import time
+import shutil
+import subprocess
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
-DEFAULT_LIGHT_MODEL = "google/gemini-3-pro-preview"
+DEFAULT_LIGHT_MODEL = "anthropic/claude-sonnet-4.6"
+
+# Model name mapping: OpenRouter-style -> Claude CLI --model flag
+_MODEL_MAP = {
+    "anthropic/claude-sonnet-4.6": "claude-sonnet-4-6",
+    "anthropic/claude-sonnet-4.5": "claude-sonnet-4-5",
+    "anthropic/claude-sonnet-4": "claude-sonnet-4",
+    "anthropic/claude-opus-4.6": "claude-opus-4-6",
+    "anthropic/claude-opus-4": "claude-opus-4",
+    "anthropic/claude-haiku-4.5": "claude-haiku-4-5",
+}
+
+# Effort mapping: Ouroboros levels -> Claude CLI --effort values
+_EFFORT_MAP = {
+    "none": "low",
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "high",
+}
+
+# JSON schema for structured tool-use output
+RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["text_response", "tool_calls"],
+            "description": "Use 'tool_calls' to invoke tools, 'text_response' for final answer"
+        },
+        "content": {
+            "type": "string",
+            "description": "Your thinking/status notes (for tool_calls) or final answer (for text_response)"
+        },
+        "tool_calls": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Tool function name"
+                    },
+                    "arguments": {
+                        "type": "object",
+                        "description": "Tool arguments as key-value pairs"
+                    }
+                },
+                "required": ["name", "arguments"]
+            },
+            "description": "Tools to call (only when action='tool_calls')"
+        }
+    },
+    "required": ["action", "content"]
+}
+
+# Short system instruction for response format (appended via --append-system-prompt)
+_FORMAT_INSTRUCTION = (
+    "Respond ONLY with valid JSON matching the provided schema. "
+    "When you need to use tools, set action='tool_calls' and provide tool_calls array. "
+    "When giving a final answer with no more tools needed, set action='text_response'. "
+    "You may call multiple tools at once in a single tool_calls response."
+)
 
 
 def normalize_reasoning_effort(value: str, default: str = "medium") -> str:
@@ -36,120 +105,179 @@ def add_usage(total: Dict[str, Any], usage: Dict[str, Any]) -> None:
         total["cost"] = float(total.get("cost") or 0) + float(usage["cost"])
 
 
-def fetch_openrouter_pricing() -> Dict[str, Tuple[float, float, float]]:
-    """
-    Fetch current pricing from OpenRouter API.
-
-    Returns dict of {model_id: (input_per_1m, cached_per_1m, output_per_1m)}.
-    Returns empty dict on failure.
-    """
-    import logging
-    log = logging.getLogger("ouroboros.llm")
-
-    try:
-        import requests
-    except ImportError:
-        log.warning("requests not installed, cannot fetch pricing")
-        return {}
-
-    try:
-        url = "https://openrouter.ai/api/v1/models"
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-
-        data = resp.json()
-        models = data.get("data", [])
-
-        # Prefixes we care about
-        prefixes = ("anthropic/", "openai/", "google/", "meta-llama/", "x-ai/", "qwen/")
-
-        pricing_dict = {}
-        for model in models:
-            model_id = model.get("id", "")
-            if not model_id.startswith(prefixes):
-                continue
-
-            pricing = model.get("pricing", {})
-            if not pricing or not pricing.get("prompt"):
-                continue
-
-            # OpenRouter pricing is in dollars per token (raw values)
-            raw_prompt = float(pricing.get("prompt", 0))
-            raw_completion = float(pricing.get("completion", 0))
-            raw_cached_str = pricing.get("input_cache_read")
-            raw_cached = float(raw_cached_str) if raw_cached_str else None
-
-            # Convert to per-million tokens
-            prompt_price = round(raw_prompt * 1_000_000, 4)
-            completion_price = round(raw_completion * 1_000_000, 4)
-            if raw_cached is not None:
-                cached_price = round(raw_cached * 1_000_000, 4)
-            else:
-                cached_price = round(prompt_price * 0.1, 4)  # fallback: 10% of prompt
-
-            # Sanity check: skip obviously wrong prices
-            if prompt_price > 1000 or completion_price > 1000:
-                log.warning(f"Skipping {model_id}: prices seem wrong (prompt={prompt_price}, completion={completion_price})")
-                continue
-
-            pricing_dict[model_id] = (prompt_price, cached_price, completion_price)
-
-        log.info(f"Fetched pricing for {len(pricing_dict)} models from OpenRouter")
-        return pricing_dict
-
-    except (requests.RequestException, ValueError, KeyError) as e:
-        log.warning(f"Failed to fetch OpenRouter pricing: {e}")
-        return {}
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~4 chars per token."""
+    return max(1, len(text) // 4)
 
 
-class LLMClient:
-    """OpenRouter API wrapper. All LLM calls go through this class."""
+def _resolve_claude_binary() -> str:
+    """Find the claude CLI binary. Checks PATH and well-known locations."""
+    # Check PATH first
+    found = shutil.which("claude")
+    if found:
+        return found
 
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        base_url: str = "https://openrouter.ai/api/v1",
-    ):
-        self._api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
-        self._base_url = base_url
-        self._client = None
+    # Well-known locations on macOS
+    well_known = [
+        os.path.expanduser("~/Library/Application Support/Claude/claude-code"),
+        "/usr/local/bin/claude",
+    ]
 
-    def _get_client(self):
-        if self._client is None:
-            from openai import OpenAI
-            self._client = OpenAI(
-                base_url=self._base_url,
-                api_key=self._api_key,
-                default_headers={
-                    "HTTP-Referer": "https://colab.research.google.com/",
-                    "X-Title": "Ouroboros",
-                },
-            )
-        return self._client
-
-    def _fetch_generation_cost(self, generation_id: str) -> Optional[float]:
-        """Fetch cost from OpenRouter Generation API as fallback."""
+    # Search versioned directories under claude-code/
+    claude_code_base = os.path.expanduser("~/Library/Application Support/Claude/claude-code")
+    if os.path.isdir(claude_code_base):
         try:
-            import requests
-            url = f"{self._base_url.rstrip('/')}/generation?id={generation_id}"
-            resp = requests.get(url, headers={"Authorization": f"Bearer {self._api_key}"}, timeout=5)
-            if resp.status_code == 200:
-                data = resp.json().get("data") or {}
-                cost = data.get("total_cost") or data.get("usage", {}).get("cost")
-                if cost is not None:
-                    return float(cost)
-            # Generation might not be ready yet — retry once after short delay
-            time.sleep(0.5)
-            resp = requests.get(url, headers={"Authorization": f"Bearer {self._api_key}"}, timeout=5)
-            if resp.status_code == 200:
-                data = resp.json().get("data") or {}
-                cost = data.get("total_cost") or data.get("usage", {}).get("cost")
-                if cost is not None:
-                    return float(cost)
-        except Exception:
-            log.debug("Failed to fetch generation cost from OpenRouter", exc_info=True)
+            versions = sorted(os.listdir(claude_code_base), reverse=True)
+            for ver in versions:
+                candidate = os.path.join(claude_code_base, ver, "claude")
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    return candidate
+        except OSError:
             pass
-        return None
+
+    for path in well_known:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+
+    raise FileNotFoundError(
+        "Claude CLI binary not found. Ensure Claude Code is installed. "
+        "Install via: npm install -g @anthropic-ai/claude-code"
+    )
+
+
+def _map_model(model: str) -> str:
+    """Convert OpenRouter-style model name to Claude CLI --model flag value."""
+    if model in _MODEL_MAP:
+        return _MODEL_MAP[model]
+    # If already in CLI format (e.g., "claude-sonnet-4-6"), return as-is
+    if model.startswith("claude-"):
+        return model
+    # Unknown model — try stripping provider prefix
+    if "/" in model:
+        bare = model.split("/", 1)[1]
+        # Convert dots to hyphens (sonnet-4.6 -> sonnet-4-6)
+        bare = bare.replace(".", "-")
+        if not bare.startswith("claude-"):
+            bare = "claude-" + bare
+        return bare
+    log.warning("Unknown model %s, falling back to claude-sonnet-4-6", model)
+    return "claude-sonnet-4-6"
+
+
+def _flatten_messages(messages: List[Dict[str, Any]]) -> str:
+    """Serialize a messages array into a single text prompt for claude -p stdin."""
+    parts = []
+
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+
+        if role == "system":
+            # System content can be multipart (list of text blocks with cache_control)
+            if isinstance(content, list):
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_parts.append(block["text"])
+                parts.append("[SYSTEM]\n" + "\n\n".join(text_parts))
+            else:
+                parts.append("[SYSTEM]\n" + str(content))
+
+        elif role == "user":
+            if isinstance(content, list):
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict):
+                        if block.get("type") == "text":
+                            text_parts.append(block["text"])
+                        elif block.get("type") == "image_url":
+                            text_parts.append("[Image attached]")
+                parts.append("[USER]\n" + "\n".join(text_parts))
+            else:
+                parts.append("[USER]\n" + str(content))
+
+        elif role == "assistant":
+            text = str(content or "")
+            tool_calls = msg.get("tool_calls") or []
+            if tool_calls:
+                calls_desc = []
+                for tc in tool_calls:
+                    fn = tc.get("function", {})
+                    fn_name = fn.get("name", "unknown")
+                    fn_args = fn.get("arguments", "{}")
+                    # Truncate long arguments for context
+                    if len(fn_args) > 500:
+                        fn_args = fn_args[:500] + "..."
+                    calls_desc.append(f"  - {fn_name}({fn_args})")
+                text += "\n[Tool calls]:\n" + "\n".join(calls_desc)
+            parts.append("[ASSISTANT]\n" + text)
+
+        elif role == "tool":
+            tool_id = msg.get("tool_call_id", "")
+            parts.append(f"[TOOL RESULT ({tool_id})]\n{content}")
+
+    return "\n\n".join(parts)
+
+
+def _embed_tool_schemas(prompt: str, tools: List[Dict[str, Any]]) -> str:
+    """Embed tool definitions into the prompt text."""
+    if not tools:
+        return prompt
+
+    tool_section = "\n\n## Available Tools\n\n"
+    tool_section += (
+        "You have access to the following tools. To use a tool, respond with "
+        "action='tool_calls' and provide the tool_calls array with name and arguments.\n\n"
+    )
+
+    for tool in tools:
+        func = tool.get("function", {})
+        name = func.get("name", "")
+        desc = func.get("description", "")
+        params = func.get("parameters", {})
+        props = params.get("properties", {})
+        required = params.get("required", [])
+
+        tool_section += f"### {name}\n{desc}\n"
+        if props:
+            tool_section += "Parameters:\n"
+            for pname, pschema in props.items():
+                req_marker = " (required)" if pname in required else ""
+                ptype = pschema.get("type", "any")
+                pdesc = pschema.get("description", "")
+                enum_vals = pschema.get("enum")
+                type_info = ptype
+                if enum_vals:
+                    type_info += f" [{', '.join(str(v) for v in enum_vals)}]"
+                tool_section += f"  - {pname}: {type_info}{req_marker} — {pdesc}\n"
+        tool_section += "\n"
+
+    return prompt + tool_section
+
+
+class ClaudeCliClient:
+    """Claude Code CLI wrapper. All LLM calls go through this class.
+
+    Uses `claude -p` with --output-format json and --json-schema
+    for structured output. Requires Claude Max subscription.
+    """
+
+    AVAILABLE_MODELS = [
+        "anthropic/claude-sonnet-4.6",
+        "anthropic/claude-sonnet-4",
+        "anthropic/claude-opus-4.6",
+        "anthropic/claude-opus-4",
+        "anthropic/claude-haiku-4.5",
+    ]
+
+    def __init__(self, api_key: Optional[str] = None, base_url: str = ""):
+        # api_key and base_url accepted for backward compatibility but ignored
+        self._claude_bin: Optional[str] = None
+
+    def _get_binary(self) -> str:
+        if self._claude_bin is None:
+            self._claude_bin = _resolve_claude_binary()
+        return self._claude_bin
 
     def chat(
         self,
@@ -160,72 +288,131 @@ class LLMClient:
         max_tokens: int = 16384,
         tool_choice: str = "auto",
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """Single LLM call. Returns: (response_message_dict, usage_dict with cost)."""
-        client = self._get_client()
-        effort = normalize_reasoning_effort(reasoning_effort)
+        """Single LLM call via claude -p. Returns: (response_message_dict, usage_dict)."""
+        claude_bin = self._get_binary()
+        cli_model = _map_model(model)
+        effort = _EFFORT_MAP.get(normalize_reasoning_effort(reasoning_effort), "medium")
 
-        extra_body: Dict[str, Any] = {
-            "reasoning": {"effort": effort, "exclude": True},
-        }
-
-        # Pin Anthropic models to Anthropic provider for prompt caching
-        if model.startswith("anthropic/"):
-            extra_body["provider"] = {
-                "order": ["Anthropic"],
-                "allow_fallbacks": False,
-                "require_parameters": True,
-            }
-
-        kwargs: Dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "extra_body": extra_body,
-        }
+        # Build the prompt
+        prompt_text = _flatten_messages(messages)
         if tools:
-            # Add cache_control to last tool for Anthropic prompt caching
-            # This caches all tool schemas (they never change between calls)
-            tools_with_cache = [t for t in tools]  # shallow copy
-            if tools_with_cache:
-                last_tool = {**tools_with_cache[-1]}  # copy last tool
-                last_tool["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
-                tools_with_cache[-1] = last_tool
-            kwargs["tools"] = tools_with_cache
-            kwargs["tool_choice"] = tool_choice
+            prompt_text = _embed_tool_schemas(prompt_text, tools)
 
-        resp = client.chat.completions.create(**kwargs)
-        resp_dict = resp.model_dump()
-        usage = resp_dict.get("usage") or {}
-        choices = resp_dict.get("choices") or [{}]
-        msg = (choices[0] if choices else {}).get("message") or {}
+        # Build command
+        cmd = [
+            claude_bin, "-p",
+            "--output-format", "json",
+            "--model", cli_model,
+            "--max-turns", "1",
+            "--no-session-persistence",
+        ]
 
-        # Extract cached_tokens from prompt_tokens_details if available
-        if not usage.get("cached_tokens"):
-            prompt_details = usage.get("prompt_tokens_details") or {}
-            if isinstance(prompt_details, dict) and prompt_details.get("cached_tokens"):
-                usage["cached_tokens"] = int(prompt_details["cached_tokens"])
+        if tools:
+            # Use JSON schema for structured tool-use output
+            cmd.extend(["--json-schema", json.dumps(RESPONSE_SCHEMA)])
+            cmd.extend(["--append-system-prompt", _FORMAT_INSTRUCTION])
+            # Disable built-in Claude Code tools — we use our own
+            cmd.extend(["--tools", ""])
 
-        # Extract cache_write_tokens from prompt_tokens_details if available
-        # OpenRouter: "cache_write_tokens"
-        # Native Anthropic: "cache_creation_tokens" or "cache_creation_input_tokens"
-        if not usage.get("cache_write_tokens"):
-            prompt_details_for_write = usage.get("prompt_tokens_details") or {}
-            if isinstance(prompt_details_for_write, dict):
-                cache_write = (prompt_details_for_write.get("cache_write_tokens")
-                              or prompt_details_for_write.get("cache_creation_tokens")
-                              or prompt_details_for_write.get("cache_creation_input_tokens"))
-                if cache_write:
-                    usage["cache_write_tokens"] = int(cache_write)
+        # Run the CLI, feeding prompt via stdin
+        try:
+            result = subprocess.run(
+                cmd,
+                input=prompt_text,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                env=os.environ.copy(),
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("Claude CLI timed out after 300s")
+        except FileNotFoundError:
+            raise RuntimeError(f"Claude CLI binary not found at {claude_bin}")
 
-        # Ensure cost is present in usage (OpenRouter includes it, but fallback if missing)
-        if not usage.get("cost"):
-            gen_id = resp_dict.get("id") or ""
-            if gen_id:
-                cost = self._fetch_generation_cost(gen_id)
-                if cost is not None:
-                    usage["cost"] = cost
+        if result.returncode != 0:
+            stderr = (result.stderr or "")[:500]
+            raise RuntimeError(f"Claude CLI error (exit {result.returncode}): {stderr}")
 
-        return msg, usage
+        # Parse response
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            # Try to extract JSON from mixed output
+            stdout = result.stdout.strip()
+            # Find the last JSON object in the output
+            last_brace = stdout.rfind("}")
+            if last_brace >= 0:
+                first_brace = stdout.rfind("{", 0, last_brace)
+                if first_brace >= 0:
+                    try:
+                        payload = json.loads(stdout[first_brace:last_brace + 1])
+                    except json.JSONDecodeError:
+                        raise RuntimeError(f"Failed to parse Claude CLI JSON output: {stdout[:500]}")
+                else:
+                    raise RuntimeError(f"Failed to parse Claude CLI output: {stdout[:500]}")
+            else:
+                raise RuntimeError(f"Failed to parse Claude CLI output: {stdout[:500]}")
+
+        # Extract the result text
+        result_text = payload.get("result", "")
+
+        # Estimate usage (no real token counts from CLI)
+        prompt_tokens = _estimate_tokens(prompt_text)
+        completion_tokens = _estimate_tokens(result_text)
+        usage = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+            "cost": 0.0,  # Free with Max subscription
+        }
+
+        # If we used JSON schema (tools mode), parse structured response
+        if tools:
+            return self._parse_structured_response(result_text, usage)
+
+        # No tools — plain text response
+        return {"content": result_text, "tool_calls": None}, usage
+
+    def _parse_structured_response(
+        self, result_text: str, usage: Dict[str, Any]
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Parse JSON-schema-validated response into the format loop.py expects."""
+        try:
+            structured = json.loads(result_text)
+        except json.JSONDecodeError:
+            # If parsing fails, treat as plain text response
+            log.warning("Failed to parse structured response, treating as text: %s", result_text[:200])
+            return {"content": result_text, "tool_calls": None}, usage
+
+        action = structured.get("action", "text_response")
+        content = structured.get("content", "")
+
+        if action == "tool_calls":
+            raw_calls = structured.get("tool_calls") or []
+            if not raw_calls:
+                # No actual tool calls despite action=tool_calls, treat as text
+                return {"content": content, "tool_calls": None}, usage
+
+            # Convert to OpenAI-compatible tool_calls format
+            tool_calls = []
+            for tc in raw_calls:
+                tool_calls.append({
+                    "id": f"call_{uuid.uuid4().hex[:12]}",
+                    "type": "function",
+                    "function": {
+                        "name": tc.get("name", ""),
+                        "arguments": json.dumps(
+                            tc.get("arguments", {}),
+                            ensure_ascii=False,
+                        ),
+                    },
+                })
+            return {"content": content, "tool_calls": tool_calls}, usage
+
+        # text_response
+        return {"content": content, "tool_calls": None}, usage
 
     def vision_query(
         self,
@@ -235,61 +422,91 @@ class LLMClient:
         max_tokens: int = 1024,
         reasoning_effort: str = "low",
     ) -> Tuple[str, Dict[str, Any]]:
-        """
-        Send a vision query to an LLM. Lightweight — no tools, no loop.
+        """Send a vision query. Uses Anthropic SDK if ANTHROPIC_API_KEY is set."""
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if api_key:
+            return self._vision_query_anthropic(prompt, images, model, max_tokens, api_key)
 
-        Args:
-            prompt: Text instruction for the model
-            images: List of image dicts. Each dict must have either:
-                - {"url": "https://..."} — for URL images
-                - {"base64": "<b64>", "mime": "image/png"} — for base64 images
-            model: VLM-capable model ID
-            max_tokens: Max response tokens
-            reasoning_effort: Effort level
+        # Fallback: describe images textually and use chat()
+        image_desc = f"[{len(images)} image(s) attached but cannot be processed without ANTHROPIC_API_KEY]"
+        messages = [{"role": "user", "content": f"{prompt}\n\n{image_desc}"}]
+        msg, usage = self.chat(messages=messages, model=model, reasoning_effort=reasoning_effort, max_tokens=max_tokens)
+        return msg.get("content") or "", usage
 
-        Returns:
-            (text_response, usage_dict)
-        """
-        # Build multipart content
-        content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+    def _vision_query_anthropic(
+        self,
+        prompt: str,
+        images: List[Dict[str, Any]],
+        model: str,
+        max_tokens: int,
+        api_key: str,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Vision query using Anthropic SDK directly."""
+        try:
+            import anthropic
+        except ImportError:
+            log.warning("anthropic package not installed, vision degraded")
+            return "(Vision unavailable: pip install anthropic)", {}
+
+        client = anthropic.Anthropic(api_key=api_key)
+        content = [{"type": "text", "text": prompt}]
         for img in images:
-            if "url" in img:
+            if "base64" in img:
                 content.append({
-                    "type": "image_url",
-                    "image_url": {"url": img["url"]},
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": img.get("mime", "image/png"),
+                        "data": img["base64"],
+                    },
                 })
-            elif "base64" in img:
-                mime = img.get("mime", "image/png")
+            elif "url" in img:
                 content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{mime};base64,{img['base64']}"},
+                    "type": "image",
+                    "source": {"type": "url", "url": img["url"]},
                 })
-            else:
-                log.warning("vision_query: skipping image with unknown format: %s", list(img.keys()))
 
-        messages = [{"role": "user", "content": content}]
-        response_msg, usage = self.chat(
-            messages=messages,
-            model=model,
-            tools=None,
-            reasoning_effort=reasoning_effort,
-            max_tokens=max_tokens,
-        )
-        text = response_msg.get("content") or ""
-        return text, usage
+        try:
+            response = client.messages.create(
+                model=_map_model(model),
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": content}],
+            )
+            text = response.content[0].text if response.content else ""
+            usage = {
+                "prompt_tokens": response.usage.input_tokens,
+                "completion_tokens": response.usage.output_tokens,
+                "total_tokens": response.usage.input_tokens + response.usage.output_tokens,
+                "cost": 0.0,
+            }
+            return text, usage
+        except Exception as e:
+            log.warning("Anthropic vision query failed: %s", e)
+            return f"(Vision query failed: {e})", {}
 
     def default_model(self) -> str:
-        """Return the single default model from env. LLM switches via tool if needed."""
-        return os.environ.get("OUROBOROS_MODEL", "anthropic/claude-sonnet-4.6")
+        """Return the default model from env."""
+        model = os.environ.get("OUROBOROS_MODEL", "anthropic/claude-sonnet-4.6")
+        if not model.startswith("anthropic/"):
+            log.warning("Non-Claude model %s not supported by CLI, using sonnet", model)
+            return "anthropic/claude-sonnet-4.6"
+        return model
 
     def available_models(self) -> List[str]:
-        """Return list of available models from env (for switch_model tool schema)."""
-        main = os.environ.get("OUROBOROS_MODEL", "anthropic/claude-sonnet-4.6")
+        """Return list of available Claude models."""
+        main = self.default_model()
+        models = [main]
         code = os.environ.get("OUROBOROS_MODEL_CODE", "")
         light = os.environ.get("OUROBOROS_MODEL_LIGHT", "")
-        models = [main]
-        if code and code != main:
-            models.append(code)
-        if light and light != main and light != code:
-            models.append(light)
+        for m in (code, light):
+            if m and m.startswith("anthropic/") and m not in models:
+                models.append(m)
+        # Add all known models not already in list
+        for m in self.AVAILABLE_MODELS:
+            if m not in models:
+                models.append(m)
         return models
+
+
+# Backward-compatible alias — all existing imports continue to work
+LLMClient = ClaudeCliClient

@@ -71,6 +71,12 @@ def _handle_multi_model_review(ctx: ToolContext, content: str = "", prompt: str 
     """Sync wrapper around async multi-model review. Registry calls this."""
     if models is None:
         models = []
+
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not api_key:
+        # No OpenRouter key — use Claude CLI for single-model review
+        return _claude_cli_review(content, prompt, ctx)
+
     try:
         try:
             asyncio.get_running_loop()
@@ -85,6 +91,52 @@ def _handle_multi_model_review(ctx: ToolContext, content: str = "", prompt: str 
     except Exception as e:
         log.error("Multi-model review failed: %s", e, exc_info=True)
         return json.dumps({"error": f"Review failed: {e}"}, ensure_ascii=False)
+
+
+def _claude_cli_review(content: str, prompt: str, ctx: ToolContext) -> str:
+    """Single-model review using Claude CLI when OPENROUTER_API_KEY is not available."""
+    if not content:
+        return json.dumps({"error": "content is required"}, ensure_ascii=False)
+    if not prompt:
+        return json.dumps({"error": "prompt is required"}, ensure_ascii=False)
+
+    try:
+        from ouroboros.llm import LLMClient
+        llm = LLMClient()
+        messages = [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": content},
+        ]
+        msg, usage = llm.chat(messages=messages, model=llm.default_model(), reasoning_effort="high")
+        text = msg.get("content") or ""
+
+        # Parse verdict from response
+        verdict = "UNKNOWN"
+        for line in text.split("\n")[:3]:
+            line_upper = line.upper()
+            if "PASS" in line_upper:
+                verdict = "PASS"
+                break
+            elif "FAIL" in line_upper:
+                verdict = "FAIL"
+                break
+
+        result = {
+            "model_count": 1,
+            "note": "Single-model review via Claude CLI (no OPENROUTER_API_KEY)",
+            "results": [{
+                "model": llm.default_model(),
+                "verdict": verdict,
+                "text": text,
+                "tokens_in": usage.get("prompt_tokens", 0),
+                "tokens_out": usage.get("completion_tokens", 0),
+                "cost_estimate": 0.0,
+            }],
+        }
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as e:
+        log.error("Claude CLI review failed: %s", e, exc_info=True)
+        return json.dumps({"error": f"CLI review failed: {e}"}, ensure_ascii=False)
 
 
 async def _query_model(client, model, messages, api_key, semaphore):
