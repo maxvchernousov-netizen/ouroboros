@@ -360,6 +360,13 @@ class ClaudeCliClient:
             else:
                 raise RuntimeError(f"Failed to parse Claude CLI output: {stdout[:500]}")
 
+        # Debug: log payload keys for troubleshooting
+        log.info("CLI payload keys: %s, subtype=%s, has_result=%s, has_structured=%s",
+                 list(payload.keys()),
+                 payload.get("subtype"),
+                 bool(payload.get("result")),
+                 bool(payload.get("structured_output")))
+
         # Extract usage from CLI response (real token counts available)
         cli_usage = payload.get("usage", {})
         prompt_tokens = int(cli_usage.get("input_tokens", 0)) + int(cli_usage.get("cache_read_input_tokens", 0))
